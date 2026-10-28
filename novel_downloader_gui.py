@@ -27,9 +27,21 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from library_awareness import (
+    Candidate,
+    LibraryDataError,
+    classify_candidates,
+    load_library,
+    parse_dry_run_title,
+    record_library_name,
+    safe_library_name,
+    verify_txt_output,
+)
+from alphapolis_search import AlphaPolisSearchClient, SearchFilters, validate_filters
+
 try:
     import customtkinter as ctk
-    from tkinter import filedialog
+    from tkinter import filedialog, messagebox
 except Exception as e:  # pragma: no cover - 起動環境依存
     sys.stderr.write(
         "customtkinter が必要です: pip install customtkinter\n"
@@ -43,7 +55,7 @@ except Exception as e:  # pragma: no cover - 起動環境依存
 APP_NAME      = "小説ePubダウンローダー"
 APP_DIR_NAME  = "NovelDownloader"          # %APPDATA%\NovelDownloader
 ICON_FILENAME = "novel_downloader.ico"
-SETTINGS_SCHEMA = 1
+SETTINGS_SCHEMA = 3
 
 IS_WINDOWS = (os.name == "nt")
 # 子プロセスに黒いコンソール窓を出さない（Windows のみ）
@@ -53,11 +65,32 @@ _CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 _RE_PROGRESS = re.compile(r"^\s+\[\s*(\d+)\s*/\s*(\d+)\s*\]")
 # 完了時の epub パス行（gui_v1_design §6 / §9.2）
 _RE_EPUB_DONE = re.compile(r"✅\s*ePub出力完了:\s*(.+)$")
-_RE_TXT_DONE = re.compile(r"✅\s*テキスト出力完了:\s*(.+)$")
+_RE_TXT_DONE = re.compile(
+    r"✅\s*テキスト出力完了:\s*(.+\.txt)(?:\s+（.*)?$", re.IGNORECASE
+)
 _RE_SPLIT_DONE = re.compile(r"✅\s*分割テキスト出力完了:\s*(.+)$")
 _RE_URL = re.compile(r"https?://[^\s'\"<>]+")
 
 ENCODING_CHOICES = ["utf-8", "utf-8-sig", "shift_jis", "cp932"]
+LIBRARY_MODE_LABELS = {"manual": "手动筛选", "auto": "自动筛选"}
+LIBRARY_MODE_VALUES = {label: value for value, label in LIBRARY_MODE_LABELS.items()}
+_STATUS_LABELS = {
+    "new": "新书",
+    "recorded": "已收录",
+    "batch_duplicate": "本批重复",
+    "inspect_failed": "检查失败",
+}
+ALPHAPOLIS_CATEGORIES = {
+    "悬疑": "110100", "恐怖": "110200", "科幻": "110300",
+    "奇幻": "110400", "恋爱": "110500", "青春": "110600",
+    "现代文学": "110700", "大众娱乐": "110800", "经济・企业": "111000",
+    "历史・时代": "111100", "儿童书・童话": "111200", "绘本": "111300",
+    "角色文艺": "111400", "轻文学": "111500", "随笔・非虚构": "111600",
+    "BL": "119000",
+}
+ALPHAPOLIS_SORTS = {"收藏数": "favorite", "更新时间": "update", "最新发布": "new"}
+_CATEGORY_BY_ID = {value: key for key, value in ALPHAPOLIS_CATEGORIES.items()}
+_SORT_BY_VALUE = {value: key for key, value in ALPHAPOLIS_SORTS.items()}
 
 
 # ══════════════════════════════════════════
@@ -107,6 +140,100 @@ def default_output_dir() -> str:
     return os.path.join(home, "Downloads", "小説")
 
 
+def _default_library_path() -> Path:
+    """返回与原书库筛查程序共用的数据文件。"""
+    workspace = Path(_app_base_dir()).resolve().parent.parent
+    return workspace / "书库筛查" / "书库筛查数据" / "书库数据.json"
+
+
+def _build_inspect_args(
+    target_url: str, settings: dict, site: str = ""
+) -> list[str]:
+    """构造不产生任何输出文件的作品信息预检参数。"""
+    if site == "aozora":
+        return ["--inspect-metadata", target_url]
+    return [target_url, "--dry-run", "--delay", str(settings["delay"])]
+
+
+def _selected_candidates(
+    candidates: list[Candidate], mode: str
+) -> list[Candidate]:
+    """根据筛选模式返回真正进入正文下载的候选。"""
+    if mode == "auto":
+        return [item for item in candidates if item.status == "new"]
+    return [
+        item
+        for item in candidates
+        if item.selected and item.status != "inspect_failed"
+    ]
+
+
+def _status_text(status: str) -> str:
+    return _STATUS_LABELS.get(status, status)
+
+
+def _status_counts(candidates: list[Candidate]) -> dict[str, int]:
+    counts = {status: 0 for status in _STATUS_LABELS}
+    for item in candidates:
+        if item.status in counts:
+            counts[item.status] += 1
+    return counts
+
+
+def _format_summary(summary: dict[str, int]) -> str:
+    """生成批处理结束时固定、易核对的中文汇总。"""
+    return (
+        "本批处理完成\n"
+        f"成功下载 {summary.get('downloaded', 0)}｜"
+        f"已收录 {summary.get('recorded_skipped', 0)}｜"
+        f"本批重复 {summary.get('batch_skipped', 0)}\n"
+        f"预检失败 {summary.get('inspect_failed', 0)}｜"
+        f"下载失败 {summary.get('download_failed', 0)}｜"
+        f"记录失败 {summary.get('record_failed', 0)}"
+    )
+
+
+def _format_alphapolis_summary(summary: dict) -> str:
+    reasons = {
+        "target_met": "已达到目标", "results_exhausted": "筛选结果已用尽",
+        "search_error": "搜索请求失败", "library_error": "书库无法读取",
+    }
+    return (
+        f"AlphaPolis 批量下载完成（{reasons.get(summary.get('stop_reason'), '已结束')}）\n"
+        f"目标 {summary.get('target', 0)}｜实际成功 {summary.get('downloaded', 0)}｜"
+        f"已扫描 {summary.get('pages_scanned', 0)} 页\n"
+        f"已收录 {summary.get('recorded_skipped', 0)}｜本批重复 {summary.get('batch_skipped', 0)}｜"
+        f"预检失败 {summary.get('inspect_failed', 0)}｜下载失败 {summary.get('download_failed', 0)}"
+    )
+
+
+def _batch_target_from_text(value: str) -> int:
+    try:
+        target = int(value.strip())
+    except (AttributeError, ValueError):
+        target = 0
+    if target <= 0:
+        raise ValueError("下载数量必须是大于 0 的整数")
+    return target
+
+
+def _batch_filters_from_values(category_label: str, complete_only: bool,
+                               char_min_text: str, char_max_text: str,
+                               sort_label: str) -> SearchFilters:
+    try:
+        char_min = int(char_min_text.strip()) if char_min_text.strip() else None
+        char_max = int(char_max_text.strip()) if char_max_text.strip() else None
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("字数必须填写整数") from exc
+    category_id = ALPHAPOLIS_CATEGORIES.get(category_label)
+    sort = ALPHAPOLIS_SORTS.get(sort_label)
+    if not category_id or not sort:
+        raise ValueError("题材或排序方式无效")
+    filters = SearchFilters(category_id, bool(complete_only), char_min, char_max, sort)
+    validate_filters(filters)
+    return filters
+
+
 # ══════════════════════════════════════════
 #  設定の永続化（gui_v1_design §13）
 # ══════════════════════════════════════════
@@ -131,6 +258,15 @@ def default_settings() -> dict:
         "delay": 1.5,
         "encoding": "utf-8",
         "output_mode": "normal",
+        "library_mode": "manual",
+        "alphapolis_batch": {
+            "category_id": "110500",
+            "complete_only": True,
+            "char_min": 19000,
+            "char_max": 50000,
+            "sort": "favorite",
+            "target_count": 100,
+        },
     }
 
 
@@ -140,7 +276,7 @@ def load_settings() -> dict:
     try:
         with open(settings_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and data.get("schema") == SETTINGS_SCHEMA:
+        if isinstance(data, dict) and data.get("schema") in (1, 2, SETTINGS_SCHEMA):
             for k in s:
                 if k in data:
                     s[k] = data[k]
@@ -163,6 +299,24 @@ def load_settings() -> dict:
         s["encoding"] = "utf-8"
     if s.get("output_mode") not in ("normal", "clean_txt", "split_txt"):
         s["output_mode"] = "normal"
+    if s.get("library_mode") not in ("manual", "auto"):
+        s["library_mode"] = "manual"
+    batch = s.get("alphapolis_batch")
+    if not isinstance(batch, dict):
+        batch = default_settings()["alphapolis_batch"]
+    defaults = default_settings()["alphapolis_batch"]
+    batch = {**defaults, **{k: batch[k] for k in defaults if k in batch}}
+    try:
+        filters = SearchFilters(
+            str(batch["category_id"]), bool(batch["complete_only"]),
+            batch["char_min"], batch["char_max"], str(batch["sort"]),
+        )
+        validate_filters(filters)
+        _batch_target_from_text(str(batch["target_count"]))
+    except (TypeError, ValueError):
+        batch = defaults
+    s["alphapolis_batch"] = batch
+    s["schema"] = SETTINGS_SCHEMA
     return s
 
 
@@ -229,7 +383,7 @@ class NovelDownloaderApp(ctk.CTk):
         self._log_open = False
 
         self.title(APP_NAME)
-        self.geometry("590x440")
+        self.geometry("590x500")
         self.minsize(520, 360)
         try:
             ico = _resource_path(ICON_FILENAME)
@@ -270,11 +424,26 @@ class NovelDownloaderApp(ctk.CTk):
         self.ent_url.grid(row=1, column=0, sticky="ew", padx=20)
         self.var_url.trace_add("write", lambda *_: self._update_download_enabled())
 
-        # 大ボタン（ダウンロード / 中止）
-        self.btn_main = ctk.CTkButton(self, text="⬇ ダウンロード", height=44,
+        # 书库筛选模式 + 大按钮（下载 / 中止）
+        action = ctk.CTkFrame(self, fg_color="transparent")
+        action.grid(row=2, column=0, sticky="ew", padx=20, pady=14)
+        action.grid_columnconfigure(0, weight=1)
+        self.btn_alphapolis_batch = ctk.CTkButton(
+            action, text="AlphaPolis 批量筛选下载", command=self._open_alphapolis_batch_dialog
+        )
+        self.btn_alphapolis_batch.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.var_library_mode = ctk.StringVar(value=LIBRARY_MODE_LABELS["manual"])
+        self.mode_switch = ctk.CTkSegmentedButton(
+            action,
+            values=[LIBRARY_MODE_LABELS["manual"], LIBRARY_MODE_LABELS["auto"]],
+            variable=self.var_library_mode,
+            command=lambda *_: self._persist(),
+        )
+        self.mode_switch.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.btn_main = ctk.CTkButton(action, text="⬇ ダウンロード", height=44,
                                       font=ctk.CTkFont(size=16, weight="bold"),
                                       command=self._on_main_button)
-        self.btn_main.grid(row=2, column=0, padx=20, pady=14)
+        self.btn_main.grid(row=2, column=0, sticky="ew")
 
         # ステータス行（進捗テキスト / 完了 / エラー）
         self.lbl_status = ctk.CTkLabel(self, text="", anchor="w", justify="left")
@@ -438,6 +607,7 @@ class NovelDownloaderApp(ctk.CTk):
             "split_txt": "純粋TXT分割（同名フォルダ・約2万字）",
         }
         self.var_output_mode.set(mode_labels.get(s.get("output_mode"), mode_labels["normal"]))
+        self.var_library_mode.set(LIBRARY_MODE_LABELS[s.get("library_mode", "manual")])
         self.lbl_outdir.configure(text=f"保存先： {s['output_dir']}")
         self._on_cover_change()
 
@@ -461,6 +631,10 @@ class NovelDownloaderApp(ctk.CTk):
                 "split_txt" if "分割" in self.var_output_mode.get()
                 else "clean_txt" if self.var_output_mode.get().startswith("純粋")
                 else "normal"),
+            "library_mode": LIBRARY_MODE_VALUES.get(
+                self.var_library_mode.get(), "manual"),
+            "alphapolis_batch": self.settings.get(
+                "alphapolis_batch", default_settings()["alphapolis_batch"]),
         }
 
     def _persist(self):
@@ -476,6 +650,9 @@ class NovelDownloaderApp(ctk.CTk):
 
     def _set_state_idle(self):
         self.btn_main.configure(text="⬇ ダウンロード", state="normal")
+        self.mode_switch.configure(state="normal")
+        self.btn_batch.configure(state="normal")
+        self.btn_alphapolis_batch.configure(state="normal")
         self.lbl_status.configure(text="", text_color=("gray10", "gray90"))
         self.bar.grid_remove()
         self.bar.stop()
@@ -485,6 +662,9 @@ class NovelDownloaderApp(ctk.CTk):
 
     def _set_state_running(self):
         self.btn_main.configure(text="⏸ 中止", state="normal")
+        self.mode_switch.configure(state="disabled")
+        self.btn_batch.configure(state="disabled")
+        self.btn_alphapolis_batch.configure(state="disabled")
         self.ent_url.configure(state="disabled")
         self.lbl_status.configure(text="準備中…", text_color=("gray10", "gray90"))
         self.bar.grid()
@@ -494,6 +674,9 @@ class NovelDownloaderApp(ctk.CTk):
 
     def _set_state_done(self):
         self.btn_main.configure(text="⬇ ダウンロード", state="normal")
+        self.mode_switch.configure(state="normal")
+        self.btn_batch.configure(state="normal")
+        self.btn_alphapolis_batch.configure(state="normal")
         self.ent_url.configure(state="normal")
         self.bar.stop()
         self.bar.configure(mode="determinate")
@@ -508,6 +691,9 @@ class NovelDownloaderApp(ctk.CTk):
     def _set_state_error(self, kind: str):
         """kind: 'unsupported' | 'hameln' | 'failed'"""
         self.btn_main.configure(text="⬇ もう一度", state="normal")
+        self.mode_switch.configure(state="normal")
+        self.btn_batch.configure(state="normal")
+        self.btn_alphapolis_batch.configure(state="normal")
         self.ent_url.configure(state="normal")
         self.bar.stop()
         self.bar.grid_remove()
@@ -542,15 +728,153 @@ class NovelDownloaderApp(ctk.CTk):
         if not url:
             return
         self._persist()
+        self._launch_inspection(url, self._collect_settings())
+
+    def _launch_inspection(self, text: str, s: dict) -> bool:
+        """让单网址输入和批量输入共用同一个预检入口。"""
+        if self._proc is not None:
+            return False
         self._epub_path = None
         self._raw_log = []
         self._abort_event.clear()
         self._set_state_running()
         self._proc = "starting"           # 二重起動防止のプレースホルダ
-        self._worker = threading.Thread(target=self._download_worker,
-                                        args=(url, self._collect_settings()),
-                                        daemon=True)
+        self._worker = threading.Thread(target=self._inspection_worker,
+                                        args=(text, s), daemon=True)
         self._worker.start()
+        return True
+
+    def _launch_alphapolis_batch(self, filters: SearchFilters, target_count: int,
+                                 s: dict) -> bool:
+        if self._proc is not None:
+            return False
+        self._epub_path = None
+        self._raw_log = []
+        self._abort_event.clear()
+        self._set_state_running()
+        self._proc = "starting"
+        self._worker = threading.Thread(
+            target=self._alphapolis_batch_worker,
+            args=(filters, target_count, s), daemon=True,
+        )
+        self._worker.start()
+        return True
+
+    def _inspect_url_candidate(self, url: str, s: dict) -> Candidate:
+        info = detect_site(url)
+        if not info or info.get("site") is None:
+            return Candidate(url, url, "", error="不支持该网站或网址格式不正确")
+        target_url = info.get("normalized_url") or url
+        site_name = info.get("display_name") or info.get("site") or ""
+        if info.get("needs_playwright"):
+            return Candidate(url, target_url, site_name, error="当前图形界面暂不支持该网站")
+        try:
+            proc = subprocess.Popen(
+                engine_cmd(*_build_inspect_args(target_url, s, info.get("site", ""))),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=_engine_env(),
+                creationflags=_CREATE_NO_WINDOW, universal_newlines=True,
+                encoding="utf-8", errors="replace",
+            )
+            self._proc = proc
+            output, _ = proc.communicate()
+            if self._abort_event.is_set():
+                return Candidate(url, target_url, site_name, error="已取消")
+            title = parse_dry_run_title(output or "") if proc.returncode == 0 else ""
+            if title:
+                return Candidate(url, target_url, site_name, title, safe_library_name(title))
+            lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+            return Candidate(url, target_url, site_name,
+                             error=lines[-1] if lines else "无法取得作品标题")
+        except Exception as exc:
+            return Candidate(url, target_url, site_name, error=f"预检启动失败：{exc}")
+
+    def _download_candidate(self, candidate: Candidate, s: dict) -> tuple[bool, str]:
+        reported_txt_path = ""
+        try:
+            args = self._build_cli_args(candidate.normalized_url, s)
+            args += ["-o", Path(candidate.library_name).stem]
+            proc = subprocess.Popen(
+                engine_cmd(*args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=_engine_env(), creationflags=_CREATE_NO_WINDOW, bufsize=1,
+                universal_newlines=True, encoding="utf-8", errors="replace",
+            )
+            self._proc = proc
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                self._queue.put(("rawlog", line))
+                mt = _RE_TXT_DONE.search(line) or _RE_SPLIT_DONE.search(line)
+                if mt:
+                    reported_txt_path = mt.group(1).strip()
+                    self._queue.put(("output", reported_txt_path))
+            return proc.wait() == 0 and verify_txt_output(reported_txt_path), reported_txt_path
+        except Exception as exc:
+            self._queue.put(("rawlog", f"[下载异常] {candidate.title or candidate.url}: {exc}"))
+            return False, ""
+
+    def _alphapolis_batch_worker(self, filters: SearchFilters, target_count: int,
+                                 s: dict) -> None:
+        summary = {"target": target_count, "downloaded": 0, "pages_scanned": 0,
+                   "checked": 0, "recorded_skipped": 0, "batch_skipped": 0,
+                   "inspect_failed": 0, "download_failed": 0, "record_failed": 0,
+                   "stop_reason": "results_exhausted"}
+        seen_names: set[str] = set()
+        try:
+            pages = AlphaPolisSearchClient(s.get("delay", 1.5)).iter_pages(
+                filters, self._abort_event.is_set)
+            for page in pages:
+                if self._abort_event.is_set():
+                    self._queue.put(("aborted",))
+                    return
+                summary["pages_scanned"] += 1
+                for url in page.novel_urls:
+                    if self._abort_event.is_set():
+                        self._queue.put(("aborted",))
+                        return
+                    candidate = self._inspect_url_candidate(url, s)
+                    summary["checked"] += 1
+                    self._queue.put(("search_status", summary["pages_scanned"],
+                                     summary["checked"], summary["downloaded"],
+                                     target_count, candidate.title or url))
+                    if candidate.error:
+                        summary["inspect_failed"] += 1
+                        self._queue.put(("rawlog", f"[预检失败] {url}: {candidate.error}"))
+                        continue
+                    try:
+                        library = load_library(_default_library_path())
+                    except LibraryDataError as exc:
+                        summary["stop_reason"] = "library_error"
+                        self._queue.put(("rawlog", f"[书库错误] {exc}"))
+                        self._queue.put(("alphapolis_finished", summary))
+                        return
+                    classify_candidates([candidate], set(library["recorded_names"]) | seen_names)
+                    if candidate.status == "recorded":
+                        summary["recorded_skipped"] += 1
+                        continue
+                    if candidate.status == "batch_duplicate":
+                        summary["batch_skipped"] += 1
+                        continue
+                    ok, _path = self._download_candidate(candidate, s)
+                    if self._abort_event.is_set():
+                        self._queue.put(("aborted",))
+                        return
+                    if not ok:
+                        summary["download_failed"] += 1
+                        continue
+                    try:
+                        record_library_name(_default_library_path(), candidate.library_name)
+                    except Exception as exc:
+                        summary["record_failed"] += 1
+                        self._queue.put(("rawlog", f"[书库记录失败] {candidate.title}: {exc}"))
+                    seen_names.add(candidate.library_name)
+                    summary["downloaded"] += 1
+                    if summary["downloaded"] >= target_count:
+                        summary["stop_reason"] = "target_met"
+                        self._queue.put(("alphapolis_finished", summary))
+                        return
+        except Exception as exc:
+            summary["stop_reason"] = "search_error"
+            self._queue.put(("rawlog", f"[搜索失败] {exc}"))
+        self._queue.put(("alphapolis_finished", summary))
 
     def _abort(self):
         self._abort_event.set()           # ワーカーが起動前チェックで参照する
@@ -587,71 +911,323 @@ class NovelDownloaderApp(ctk.CTk):
     @staticmethod
     def _extract_urls(text: str) -> list:
         urls = []
-        seen = set()
         for match in _RE_URL.finditer(text):
             url = match.group(0).rstrip(".,;:!?)]}、。，；：！？）】」』")
             # AlphaPolis の分類・タグURLを除き、作品トップURLだけを採用。
             if "alphapolis.co.jp" in url and not re.search(
                     r"alphapolis\.co\.jp/novel/\d+/\d+(?:[/?#]|$)", url):
                 continue
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
+            urls.append(url)
         return urls
 
-    def _download_worker(self, text: str, s: dict):
+    def _inspection_worker(self, text: str, s: dict):
+        """只获取作品标题并在正文下载前完成书库分类。"""
+        try:
+            library = load_library(_default_library_path())
+        except LibraryDataError as exc:
+            self._queue.put(("library_error", str(exc)))
+            return
+
         urls = self._extract_urls(text)
         if not urls:
             self._queue.put(("precheck", "unsupported"))
             return
-        succeeded = 0
-        failed = 0
+
+        candidates: list[Candidate] = []
         for index, url in enumerate(urls, 1):
             if self._abort_event.is_set():
                 self._queue.put(("aborted",))
                 return
-            self._queue.put(("batch_status", index, len(urls), url))
+            self._queue.put(("inspection_progress", index, len(urls), url))
             info = detect_site(url)
-            if not info or info.get("site") is None or info.get("needs_playwright"):
-                failed += 1
-                self._queue.put(("rawlog", f"[スキップ] 対応できないURL: {url}"))
+            if not info or info.get("site") is None:
+                candidates.append(Candidate(
+                    url, url, "", error="不支持该网站或网址格式不正确"
+                ))
                 continue
             target_url = info.get("normalized_url") or url
+            site_name = info.get("display_name") or info.get("site") or ""
+            if info.get("needs_playwright"):
+                candidates.append(Candidate(
+                    url, target_url, site_name, error="当前图形界面暂不支持该网站"
+                ))
+                continue
             try:
                 proc = subprocess.Popen(
-                    engine_cmd(*self._build_cli_args(target_url, s)),
+                    engine_cmd(*_build_inspect_args(target_url, s, info.get("site", ""))),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=_engine_env(),
+                    creationflags=_CREATE_NO_WINDOW,
+                    universal_newlines=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self._proc = proc
+                if self._abort_event.is_set():
+                    proc.terminate()
+                output, _ = proc.communicate()
+                if self._abort_event.is_set():
+                    self._queue.put(("aborted",))
+                    return
+                title = parse_dry_run_title(output or "") if proc.returncode == 0 else ""
+                if title:
+                    candidates.append(Candidate(
+                        url=url,
+                        normalized_url=target_url,
+                        site=site_name,
+                        title=title,
+                        library_name=safe_library_name(title),
+                    ))
+                else:
+                    lines = [line.strip() for line in (output or "").splitlines()
+                             if line.strip()]
+                    error = lines[-1] if lines else "无法取得作品标题"
+                    candidates.append(Candidate(
+                        url, target_url, site_name, error=error
+                    ))
+            except Exception as exc:
+                candidates.append(Candidate(
+                    url, target_url, site_name, error=f"预检启动失败：{exc}"
+                ))
+
+        for candidate in candidates:
+            if candidate.error:
+                self._queue.put((
+                    "rawlog",
+                    f"[预检失败] {candidate.title or candidate.url}: {candidate.error}",
+                ))
+        classify_candidates(candidates, set(library["recorded_names"]))
+        self._queue.put(("inspection_ready", candidates, s))
+
+    def _begin_candidate_download(self, candidates: list[Candidate], s: dict):
+        """在预检/人工选择后启动候选下载线程。"""
+        self._abort_event.clear()
+        self._set_state_running()
+        self._proc = "starting"
+        self._worker = threading.Thread(
+            target=self._download_worker,
+            args=(candidates, s),
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _show_selection_dialog(self, candidates: list[Candidate], s: dict):
+        """显示手动筛选列表，并把用户选择交给下载阶段。"""
+        self._proc = "awaiting_selection"
+        counts = _status_counts(candidates)
+        win = ctk.CTkToplevel(self)
+        win.title("下载前书库筛查")
+        win.geometry("820x580")
+        win.minsize(680, 460)
+        win.transient(self)
+        win.grab_set()
+
+        summary_text = (
+            f"新书 {counts['new']}　已收录 {counts['recorded']}　"
+            f"本批重复 {counts['batch_duplicate']}　"
+            f"检查失败 {counts['inspect_failed']}"
+        )
+        ctk.CTkLabel(
+            win,
+            text="请选择要下载的小说",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(16, 2))
+        ctk.CTkLabel(win, text=summary_text, anchor="w", text_color="gray").pack(
+            fill="x", padx=18, pady=(0, 10)
+        )
+
+        scroll = ctk.CTkScrollableFrame(win)
+        scroll.pack(fill="both", expand=True, padx=18, pady=4)
+        scroll.grid_columnconfigure(1, weight=1)
+        selections: list[tuple[Candidate, ctk.BooleanVar]] = []
+        status_colors = {
+            "new": ("#1a7f37", "#3fb950"),
+            "recorded": ("#9a6700", "#d29922"),
+            "batch_duplicate": ("#9a6700", "#d29922"),
+            "inspect_failed": ("#b3261e", "#f2b8b5"),
+        }
+        for row_index, candidate in enumerate(candidates):
+            variable = ctk.BooleanVar(value=bool(candidate.selected))
+            checkbox = ctk.CTkCheckBox(scroll, text="", width=28, variable=variable)
+            checkbox.grid(row=row_index, column=0, padx=(8, 4), pady=7)
+            if candidate.status == "inspect_failed":
+                checkbox.configure(state="disabled")
+            display = candidate.title or candidate.url
+            detail = candidate.site
+            if candidate.error:
+                detail = f"{detail}　{candidate.error}".strip()
+            text_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+            text_frame.grid(row=row_index, column=1, sticky="ew", pady=5)
+            ctk.CTkLabel(text_frame, text=display, anchor="w", justify="left").pack(
+                fill="x"
+            )
+            ctk.CTkLabel(
+                text_frame,
+                text=detail,
+                anchor="w",
+                justify="left",
+                text_color="gray",
+                font=ctk.CTkFont(size=11),
+            ).pack(fill="x")
+            ctk.CTkLabel(
+                scroll,
+                text=_status_text(candidate.status),
+                text_color=status_colors.get(candidate.status, "gray"),
+                width=80,
+            ).grid(row=row_index, column=2, padx=10)
+            selections.append((candidate, variable))
+
+        buttons = ctk.CTkFrame(win, fg_color="transparent")
+        buttons.pack(fill="x", padx=18, pady=(8, 16))
+
+        def select_new():
+            for candidate, variable in selections:
+                variable.set(candidate.status == "new")
+
+        def clear_all():
+            for _candidate, variable in selections:
+                variable.set(False)
+
+        def close_dialog():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+            self._proc = None
+            self._set_state_idle()
+
+        def download_selected():
+            for candidate, variable in selections:
+                candidate.selected = bool(variable.get())
+            selected = _selected_candidates(candidates, "manual")
+            if not selected:
+                messagebox.showwarning("没有选择", "请至少选择一本可以下载的小说。", parent=win)
+                return
+            has_duplicate = any(
+                item.status in ("recorded", "batch_duplicate") for item in selected
+            )
+            if has_duplicate and not messagebox.askyesno(
+                "确认下载重复作品",
+                "所选重复作品可能覆盖输出目录中的同名文件，仍要继续吗？",
+                parent=win,
+            ):
+                return
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+            self._begin_candidate_download(candidates, s)
+
+        ctk.CTkButton(buttons, text="全选新书", width=100, command=select_new).pack(
+            side="left"
+        )
+        ctk.CTkButton(
+            buttons, text="全部取消", width=100, fg_color="gray40", command=clear_all
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            buttons, text="取消", width=90, fg_color="gray40", command=close_dialog
+        ).pack(side="right")
+        ctk.CTkButton(
+            buttons, text="下载所选", width=130, command=download_selected
+        ).pack(side="right", padx=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", close_dialog)
+
+    def _download_worker(self, candidates: list[Candidate], s: dict):
+        selected = _selected_candidates(candidates, s.get("library_mode", "manual"))
+        selected_ids = {id(item) for item in selected}
+        summary = {
+            "downloaded": 0,
+            "recorded_skipped": sum(
+                item.status == "recorded" and id(item) not in selected_ids
+                for item in candidates
+            ),
+            "batch_skipped": sum(
+                item.status == "batch_duplicate" and id(item) not in selected_ids
+                for item in candidates
+            ),
+            "inspect_failed": sum(
+                item.status == "inspect_failed" for item in candidates
+            ),
+            "download_failed": 0,
+            "record_failed": 0,
+        }
+        for index, candidate in enumerate(selected, 1):
+            if self._abort_event.is_set():
+                self._queue.put(("aborted",))
+                return
+            self._queue.put((
+                "batch_status", index, len(selected), candidate.title or candidate.url
+            ))
+            reported_txt_path = ""
+            proc = None
+            try:
+                download_args = self._build_cli_args(candidate.normalized_url, s)
+                download_args += ["-o", Path(candidate.library_name).stem]
+                proc = subprocess.Popen(
+                    engine_cmd(*download_args),
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     env=_engine_env(), creationflags=_CREATE_NO_WINDOW,
                     bufsize=1, universal_newlines=True, encoding="utf-8", errors="replace",
                 )
-            except Exception as e:
-                failed += 1
-                self._queue.put(("rawlog", f"[起動失敗] {url}: {e}"))
+                self._proc = proc
+                if self._abort_event.is_set():
+                    proc.terminate()
+                for line in proc.stdout:
+                    line = line.rstrip("\n")
+                    self._queue.put(("rawlog", line))
+                    m = _RE_PROGRESS.match(line)
+                    if m:
+                        self._queue.put(("progress", int(m.group(1)), int(m.group(2))))
+                    md = _RE_EPUB_DONE.search(line)
+                    if md:
+                        self._queue.put(("epub", md.group(1).strip()))
+                    mt = _RE_TXT_DONE.search(line)
+                    if mt:
+                        reported_txt_path = mt.group(1).strip()
+                        self._queue.put(("output", reported_txt_path))
+                    ms = _RE_SPLIT_DONE.search(line)
+                    if ms:
+                        reported_txt_path = ms.group(1).strip()
+                        self._queue.put(("output", reported_txt_path))
+                rc = proc.wait()
+                output_valid = verify_txt_output(reported_txt_path)
+            except Exception as exc:
+                if proc is not None and hasattr(proc, "terminate"):
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                if self._abort_event.is_set():
+                    self._queue.put(("aborted",))
+                    return
+                summary["download_failed"] += 1
+                self._queue.put((
+                    "rawlog", f"[下载异常] {candidate.title or candidate.url}: {exc}"
+                ))
                 continue
-            self._proc = proc
             if self._abort_event.is_set():
-                proc.terminate()
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                self._queue.put(("rawlog", line))
-                m = _RE_PROGRESS.match(line)
-                if m:
-                    self._queue.put(("progress", int(m.group(1)), int(m.group(2))))
-                md = _RE_EPUB_DONE.search(line)
-                if md:
-                    self._queue.put(("epub", md.group(1).strip()))
-                mt = _RE_TXT_DONE.search(line)
-                if mt:
-                    self._queue.put(("output", mt.group(1).strip()))
-                ms = _RE_SPLIT_DONE.search(line)
-                if ms:
-                    self._queue.put(("output", ms.group(1).strip()))
-            rc = proc.wait()
-            if rc == 0:
-                succeeded += 1
-            else:
-                failed += 1
-        self._queue.put(("batch_finished", succeeded, len(urls), failed))
+                self._queue.put(("aborted",))
+                return
+            if rc != 0 or not output_valid:
+                summary["download_failed"] += 1
+                self._queue.put((
+                    "rawlog",
+                    f"[下载失败] {candidate.title or candidate.url}: 未确认有效TXT输出",
+                ))
+                continue
+            summary["downloaded"] += 1
+            try:
+                record_library_name(_default_library_path(), candidate.library_name)
+            except Exception as exc:
+                summary["record_failed"] += 1
+                self._queue.put((
+                    "rawlog", f"[书库记录失败] {candidate.title}: {exc}"
+                ))
+        self._queue.put(("batch_finished", summary))
 
     # ── キュー監視（UIスレッド・§6） ──────────────────────────
     def _poll_queue(self):
@@ -676,6 +1252,14 @@ class NovelDownloaderApp(ctk.CTk):
                 self.bar.configure(mode="determinate")
             self.bar.set(n / m if m else 0)
             self.lbl_status.configure(text=f"取得中…  第 {n} 話 / 全 {m} 話")
+        elif kind == "inspection_progress":
+            self.lbl_status.configure(
+                text=f"正在检查书库… 作品 {msg[1]} / {msg[2]}"
+            )
+        elif kind == "search_status":
+            self.lbl_status.configure(
+                text=f"已扫描 {msg[1]} 页｜已检查 {msg[2]} 本｜成功 {msg[3]}/{msg[4]}\n{msg[5]}"
+            )
         elif kind == "epub":
             self._epub_path = msg[1]
         elif kind == "output":
@@ -690,6 +1274,20 @@ class NovelDownloaderApp(ctk.CTk):
         elif kind == "precheck":
             self._proc = None
             self._set_state_error(msg[1])
+        elif kind == "library_error":
+            self._proc = None
+            self._set_state_error("failed")
+            self.lbl_status.configure(
+                text=f"⚠ 无法安全读取书库\n{_default_library_path()}\n{msg[1]}",
+                text_color=("#b3261e", "#f2b8b5"),
+            )
+        elif kind == "inspection_ready":
+            self._proc = None
+            candidates, settings = msg[1], msg[2]
+            if settings.get("library_mode") == "auto":
+                self._begin_candidate_download(candidates, settings)
+            else:
+                self._show_selection_dialog(candidates, settings)
         elif kind == "aborted":
             self._proc = None
             self._set_state_idle()
@@ -708,19 +1306,43 @@ class NovelDownloaderApp(ctk.CTk):
             else:
                 self._set_state_error("failed")
         elif kind == "batch_finished":
-            succeeded, total, failed = msg[1], msg[2], msg[3]
+            summary = msg[1]
             self._proc = None
             if self._abort_event.is_set():
                 self._set_state_idle()
                 self.lbl_status.configure(text="中止しました。")
-            elif succeeded:
+            elif summary["downloaded"]:
                 self._set_state_done()
                 self.lbl_status.configure(
-                    text=f"✅ 完了：成功 {succeeded} / {total}、失敗・スキップ {failed}",
+                    text="✅ " + _format_summary(summary),
                     text_color=("#1a7f37", "#3fb950"))
                 self._open_folder()
             else:
-                self._set_state_error("failed")
+                self._set_state_idle()
+                prefix = "本批没有需要下载的新书\n" if not summary["download_failed"] else ""
+                self.lbl_status.configure(
+                    text=prefix + _format_summary(summary),
+                    text_color=("gray20", "gray80"),
+                )
+            if summary["inspect_failed"] or summary["download_failed"] or summary["record_failed"]:
+                self.frm_aux.grid()
+                self.btn_log.grid(row=0, column=0, padx=(0, 8))
+        elif kind == "alphapolis_finished":
+            summary = msg[1]
+            self._proc = None
+            if summary["downloaded"]:
+                self._set_state_done()
+                self.lbl_status.configure(text="✅ " + _format_alphapolis_summary(summary),
+                                          text_color=("#1a7f37", "#3fb950"))
+                self._open_folder()
+            else:
+                self._set_state_idle()
+                self.lbl_status.configure(text=_format_alphapolis_summary(summary),
+                                          text_color=("gray20", "gray80"))
+            if (summary["inspect_failed"] or summary["download_failed"]
+                    or summary["record_failed"] or summary["stop_reason"] in ("search_error", "library_error")):
+                self.frm_aux.grid()
+                self.btn_log.grid(row=0, column=0, padx=(0, 8))
 
     def _fallback_epub_path(self):
         """epub パス未捕捉なら出力先の最新 .epub を採用（§6）。"""
@@ -799,7 +1421,70 @@ class NovelDownloaderApp(ctk.CTk):
             self.var_outdir.set(d)
             self._persist()
 
+    def _open_alphapolis_batch_dialog(self):
+        if self._proc is not None:
+            return
+        saved = self.settings.get("alphapolis_batch", default_settings()["alphapolis_batch"])
+        win = ctk.CTkToplevel(self)
+        win.title("AlphaPolis 批量筛选下载")
+        win.geometry("460x390")
+        win.transient(self)
+        form = ctk.CTkFrame(win, fg_color="transparent")
+        form.pack(fill="both", expand=True, padx=22, pady=18)
+        form.grid_columnconfigure(1, weight=1)
+
+        category = ctk.StringVar(value=_CATEGORY_BY_ID.get(saved["category_id"], "恋爱"))
+        complete = ctk.BooleanVar(value=bool(saved["complete_only"]))
+        char_min = ctk.StringVar(value="" if saved["char_min"] is None else str(saved["char_min"]))
+        char_max = ctk.StringVar(value="" if saved["char_max"] is None else str(saved["char_max"]))
+        sort = ctk.StringVar(value=_SORT_BY_VALUE.get(saved["sort"], "收藏数"))
+        target = ctk.StringVar(value=str(saved["target_count"]))
+
+        ctk.CTkLabel(form, text="题材").grid(row=0, column=0, sticky="w", pady=6)
+        ctk.CTkOptionMenu(form, values=list(ALPHAPOLIS_CATEGORIES), variable=category).grid(
+            row=0, column=1, sticky="ew", pady=6)
+        ctk.CTkCheckBox(form, text="只下载已完结", variable=complete).grid(
+            row=1, column=1, sticky="w", pady=6)
+        ctk.CTkLabel(form, text="最小字数").grid(row=2, column=0, sticky="w", pady=6)
+        ctk.CTkEntry(form, textvariable=char_min, placeholder_text="不限制").grid(
+            row=2, column=1, sticky="ew", pady=6)
+        ctk.CTkLabel(form, text="最大字数").grid(row=3, column=0, sticky="w", pady=6)
+        ctk.CTkEntry(form, textvariable=char_max, placeholder_text="不限制").grid(
+            row=3, column=1, sticky="ew", pady=6)
+        ctk.CTkLabel(form, text="排序").grid(row=4, column=0, sticky="w", pady=6)
+        ctk.CTkOptionMenu(form, values=list(ALPHAPOLIS_SORTS), variable=sort).grid(
+            row=4, column=1, sticky="ew", pady=6)
+        ctk.CTkLabel(form, text="下载数量").grid(row=5, column=0, sticky="w", pady=6)
+        ctk.CTkEntry(form, textvariable=target).grid(row=5, column=1, sticky="ew", pady=6)
+
+        buttons = ctk.CTkFrame(form, fg_color="transparent")
+        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(20, 0))
+
+        def start():
+            try:
+                filters = _batch_filters_from_values(
+                    category.get(), complete.get(), char_min.get(), char_max.get(), sort.get())
+                target_count = _batch_target_from_text(target.get())
+            except ValueError as exc:
+                messagebox.showwarning("筛选条件有误", str(exc), parent=win)
+                return
+            settings = self._collect_settings()
+            settings["alphapolis_batch"] = {
+                "category_id": filters.category_id, "complete_only": filters.complete_only,
+                "char_min": filters.char_min, "char_max": filters.char_max,
+                "sort": filters.sort, "target_count": target_count,
+            }
+            self.settings = settings
+            save_settings(settings)
+            win.destroy()
+            self._launch_alphapolis_batch(filters, target_count, settings)
+
+        ctk.CTkButton(buttons, text="取消", fg_color="gray40", command=win.destroy).pack(side="right")
+        ctk.CTkButton(buttons, text="开始批量下载", command=start).pack(side="right", padx=(0, 8))
+
     def _open_batch_dialog(self):
+        if self._proc is not None:
+            return
         win = ctk.CTkToplevel(self)
         win.title("複数リンク / TXTを読み込む")
         win.geometry("720x520")
@@ -829,21 +1514,15 @@ class NovelDownloaderApp(ctk.CTk):
             box.insert("1.0", content)
 
         def start_batch():
+            if self._proc is not None:
+                return
             text = box.get("1.0", "end").strip()
             urls = self._extract_urls(text)
             if not urls:
                 return
             win.destroy()
             self._persist()
-            self._epub_path = None
-            self._raw_log = []
-            self._abort_event.clear()
-            self._set_state_running()
-            self._proc = "starting"
-            self._worker = threading.Thread(
-                target=self._download_worker,
-                args=(text, self._collect_settings()), daemon=True)
-            self._worker.start()
+            self._launch_inspection(text, self._collect_settings())
 
         buttons = ctk.CTkFrame(win, fg_color="transparent")
         buttons.pack(fill="x", padx=16, pady=(4, 14))

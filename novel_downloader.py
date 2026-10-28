@@ -7164,8 +7164,19 @@ def aozora_fetch_html(url: str) -> str:
         try:
             req = Request(url, headers=_AOZORA_HEADERS)
             with urlopen(req, timeout=30) as r:
-                charset = r.headers.get_content_charset() or "shift_jis"
-                return r.read().decode(charset, errors="replace")
+                raw = r.read()
+                charset = r.headers.get_content_charset()
+                if not charset:
+                    meta = re.search(
+                        br"charset\s*=\s*[\"']?\s*([A-Za-z0-9._-]+)",
+                        raw[:4096],
+                        re.IGNORECASE,
+                    )
+                    charset = (
+                        meta.group(1).decode("ascii", errors="ignore")
+                        if meta else "shift_jis"
+                    )
+                return raw.decode(charset, errors="replace")
         except HTTPError as e:
             if e.code == 404:
                 raise
@@ -7194,11 +7205,28 @@ def aozora_get_work_info(html: str) -> dict:
         m = re.search(r"作品名[：:]\s*([^\n<]+)", html)
         if m:
             title = m.group(1).strip()
+    if not title:
+        m = re.search(
+            r"作品名[：:]\s*</td>\s*<td[^>]*>\s*"
+            r"(?:<[^>]+>\s*)*([^<]+)",
+            html,
+            re.IGNORECASE,
+        )
+        if m:
+            title = m.group(1).strip()
 
     author = ""
     m = re.search(
-        r'<a[^>]+href="[^"]*index_pages/person[^"]*"[^>]*>([^<]+)</a>', html
+        r'著者名[：:].*?<a[^>]+href="[^"]*index_pages/person[^"]*"'
+        r'[^>]*>([^<]+)</a>',
+        html,
+        re.DOTALL,
     )
+    if not m:
+        m = re.search(
+            r'<a[^>]+href="[^"]*index_pages/person[^"]*"[^>]*>([^<]+)</a>',
+            html,
+        )
     if m:
         author = m.group(1).strip()
 
@@ -9573,6 +9601,10 @@ def _main(argv=None):
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="作品情報（タイトル・著者・総話数）を確認して終了する。"
                              "ダウンロード・ファイル出力は一切行わない")
+    parser.add_argument("--inspect-metadata", dest="inspect_metadata",
+                        default=None, metavar="URL",
+                        help="GUI用の作品メタデータ取得モード。対応サイトでは本文やZIPを"
+                             "取得せずタイトル・著者だけを表示して終了する")
     parser.add_argument("--watch", dest="watch", default=None, metavar="FILE",
                         help="ウォッチリストファイル（URLリスト）を指定して新着を監視する。"
                              "新着があれば通知し、auto=true のエントリは自動 DL する。"
@@ -9614,6 +9646,28 @@ def _main(argv=None):
             (json.dumps(sites, ensure_ascii=False) + "\n").encode("utf-8"))
         sys.stdout.flush()
         sys.exit(0)
+
+    # ── --inspect-metadata: GUI用・本文を取得しない軽量メタデータ取得 ──
+    if getattr(args, "inspect_metadata", None):
+        _url = args.inspect_metadata
+        _site = detect_site(_url)
+        if _site != "aozora":
+            print("エラー: このサイトの軽量メタデータ取得には対応していません。")
+            sys.exit(2)
+        try:
+            _html = aozora_fetch_html(_url)
+            _info = aozora_get_work_info(_html)
+        except Exception as e:
+            print(f"エラー: 作品情報の取得に失敗しました — {e}")
+            sys.exit(1)
+        if not _info.get("title"):
+            print("エラー: タイトルを取得できませんでした。")
+            sys.exit(1)
+        print(f"タイトル : {_info['title']}")
+        if _info.get("author"):
+            print(f"著者     : {_info['author']}")
+        print("[inspect-metadata] 本文・ZIPは取得していません。")
+        return
 
     # ── --detect-site: サイト判定（GUI用・読み取り専用・オフライン・短縮URL展開なし） ──
     if getattr(args, "detect_site", None):
